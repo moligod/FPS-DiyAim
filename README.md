@@ -19,7 +19,7 @@
 - 配置存储：仅使用注册表 HKCU\Software\MoligodCrosshair（不再使用本地 json）
 - UI 细节：预设下拉的占位“下拉选择准星预设”不出现在候选中
 - 图标：EXE/任务栏/窗口/托盘统一使用 tx.ico
-
+- 快捷键：按住隐藏准星，按住显示准星，点击切换准星，支持键盘和鼠标以及鼠标侧键
 ## 快速开始
 1. 运行 dist_release\MoliCrosshair.exe
 2. 选择样式并调整参数
