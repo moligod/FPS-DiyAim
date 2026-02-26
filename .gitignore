@@ -6,3 +6,4 @@ build_venv/
 .vscode/
 config.json
 venv_clean/
+memory.md

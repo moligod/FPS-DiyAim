@@ -13,6 +13,16 @@ import threading
 import winreg
 import subprocess
 import keyboard
+# import mouse
+import win32gui
+import win32con
+from pynput import mouse as pynput_mouse
+import time
+import zlib
+import tkinter.simpledialog as simpledialog
+
+import tkinter.scrolledtext as scrolledtext
+import datetime
 
 # Windows API constants for click-through
 GWL_EXSTYLE = -20
@@ -24,6 +34,9 @@ class CrosshairOverlay(tk.Toplevel):
         super().__init__(master)
         self.config = config
         self.title("Overlay")
+        self._image_job = None
+        self.last_center_x = None
+        self.last_center_y = None
         
         # Remove decorations
         self.overrideredirect(True)
@@ -53,6 +66,16 @@ class CrosshairOverlay(tk.Toplevel):
         
         # Start keep-on-top loop
         self.keep_on_top()
+
+    def ensure_canvas_size(self, w, h):
+        w = max(10, int(w))
+        h = max(10, int(h))
+        if self.width != w or self.height != h:
+            self.width = w
+            self.height = h
+            self.canvas.config(width=self.width, height=self.height)
+            if self.last_center_x is not None and self.last_center_y is not None:
+                self.set_position(self.last_center_x, self.last_center_y)
 
     def config_bg(self, color):
         self.configure(bg=color)
@@ -84,48 +107,88 @@ class CrosshairOverlay(tk.Toplevel):
 
     def redraw(self):
         self.canvas.delete("all")
-        cx, cy = self.width // 2, self.height // 2
-        
         size = self.config['size'].get()
         color = self.config['color'].get()
         thickness = self.config['thickness'].get()
         dot = self.config['dot'].get()
         style = self.config['style'].get()
+        req_w = self.width
+        req_h = self.height
+        # Defer heavy custom image loading to avoid startup contention
+        if style == "Custom" or style in ["自定义图片", "自定义"]:
+            if self._image_job:
+                try:
+                    self.after_cancel(self._image_job)
+                except Exception:
+                    pass
+                self._image_job = None
+            self._image_job = self.after(200, self._draw_custom_image)
+            return
+        # Vector styles sizing
+        base = max(size + thickness * 2, dot + thickness * 2)
+        base = max(base, thickness * 2 + 2)
+        req_w = req_h = base + 20
+        self.ensure_canvas_size(req_w, req_h)
+        cx, cy = self.width // 2, self.height // 2
         
         if style == "Cross" or style == "Both" or style == "十字" or style == "混合":
             # Horizontal
             self.canvas.create_line(cx - size//2, cy, cx + size//2, cy, 
-                                    fill=color, width=thickness)
+                                    fill=color, width=thickness, tags="crosshair")
             # Vertical
             self.canvas.create_line(cx, cy - size//2, cx, cy + size//2, 
-                                    fill=color, width=thickness)
+                                    fill=color, width=thickness, tags="crosshair")
             
         if style == "Dot" or style == "Both" or style == "圆点" or style == "混合":
             r = dot // 2
             self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r, 
-                                    fill=color, outline=color)
+                                    fill=color, outline=color, tags="crosshair")
         
         if style == "Circle" or style == "圆圈":
             r = size // 2
             self.canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                    outline=color, width=thickness)
+                                    outline=color, width=thickness, tags="crosshair")
                                     
-        if style == "Custom" or style == "自定义":
+        # Note: Custom image is handled in the fast-path above
+
+    def _draw_custom_image(self):
+        try:
             image_path = self.config.get('image_path', {}).get()
-            if image_path and os.path.exists(image_path):
+            if not (image_path and os.path.exists(image_path)):
+                return
+            with Image.open(image_path) as im:
+                im = im.convert("RGBA")
                 try:
-                    # Use binary read and base64 encoding to support non-ASCII paths (e.g. Chinese)
-                    with open(image_path, "rb") as f:
-                        img_data = f.read()
-                    b64_data = base64.b64encode(img_data)
-                    self.image_ref = tk.PhotoImage(data=b64_data)
-                    self.canvas.create_image(cx, cy, image=self.image_ref, anchor="center")
-                except Exception as e:
-                    print(f"Error loading image: {e}")
+                    scale = int(self.config.get('img_scale', {}).get())
+                except Exception:
+                    scale = 100
+                scale = max(5, min(200, scale))
+                if scale != 100:
+                    new_w = max(1, int(im.width * scale / 100))
+                    new_h = max(1, int(im.height * scale / 100))
+                    im = im.resize((new_w, new_h), Image.LANCZOS)
+                self.image_ref = ImageTk.PhotoImage(im)
+                req_w, req_h = self.image_ref.width(), self.image_ref.height()
+                max_w = max(1, self.winfo_screenwidth() * 2)
+                max_h = max(1, self.winfo_screenheight() * 2)
+                if req_w <= 0 or req_h <= 0 or req_w > 20000 or req_h > 20000:
+                    return
+                if req_w > max_w or req_h > max_h:
+                    return
+                self.canvas.delete("all")
+                self.ensure_canvas_size(req_w, req_h)
+                cx, cy = self.width // 2, self.height // 2
+                self.canvas.create_image(cx, cy, image=self.image_ref, anchor="center", tags="crosshair")
+        except Exception as e:
+            print(f"Error loading image: {e}")
+        finally:
+            self._image_job = None
 
     def set_position(self, x, y):
         # x, y are center coordinates
         # We need to convert to top-left for geometry
+        self.last_center_x = x
+        self.last_center_y = y
         tl_x = x - self.width // 2
         tl_y = y - self.height // 2
         self.geometry(f"{self.width}x{self.height}+{tl_x}+{tl_y}")
@@ -136,13 +199,14 @@ class ControlPanel:
         
         # Check Admin Status
         self.is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-        title = "moligod小工具"
+        title = "自定义准星"
         if self.is_admin:
             title += " - 管理员模式"
         else:
             title += " - 非管理员模式"
             
         self.root.title(title)
+        
         try:
             self.root.iconbitmap(self.resource_path("tx.ico"))
         except:
@@ -168,15 +232,28 @@ class ControlPanel:
             'thickness': tk.IntVar(value=2),
             'color': tk.StringVar(value="#00FF00"),
             'dot': tk.IntVar(value=4),
+            'img_scale': tk.IntVar(value=100),
             'style': tk.StringVar(value="十字"),
             'image_path': tk.StringVar(value=""),
             'force_admin': tk.BooleanVar(value=False),
-            'hide_hotkey': tk.StringVar(value="")
+            'hide_hotkey': tk.StringVar(value=""),
+            'trigger_type': tk.StringVar(value="keyboard"),
+            'trigger_mode': tk.StringVar(value="点击切换")
         }
         
         self.presets = {}
         self.current_preset_name = tk.StringVar()
+        self.PRESET_PLACEHOLDER = "<--下拉选择准星预设-->"
         self.crosshair_visible = True
+        
+        self.mouse_listener = None
+        self.keyboard_hooks = []
+        
+        # State tracking for hold modes
+        self.is_pressed = False
+        
+        # Lock to prevent race conditions during trigger application
+        self.trigger_lock = threading.Lock()
         
         self.load_config()
         
@@ -188,6 +265,8 @@ class ControlPanel:
         # Call this AFTER starting overlay so update_overlay works
         self.on_style_change(event="Startup") 
         self.update_preset_list()
+        # Ensure visible on startup regardless of trigger mode
+        self.root.after(0, lambda: self.set_visible(True, force=True))
         
         # Add keyboard bindings to the Control Panel for fine tuning
         self.root.bind("<Up>", lambda e: self.adjust_pos(0, -1))
@@ -201,6 +280,18 @@ class ControlPanel:
         self.tray_icon = None
         
         self.root.mainloop()
+
+    def on_img_scale_change(self, val):
+        try:
+            v = int(float(val))
+        except Exception:
+            v = self.config['img_scale'].get()
+        v = max(5, min(200, v))
+        self.img_scale_label.set(f"图像({v}%)")
+        # Ensure variable stays clamped
+        if self.config['img_scale'].get() != v:
+            self.config['img_scale'].set(v)
+        self.update_overlay()
 
     def check_startup(self):
         try:
@@ -304,7 +395,7 @@ class ControlPanel:
         
         ttk.Label(style_frame, text="类型:").grid(row=0, column=0, padx=5, pady=5)
         type_cb = ttk.Combobox(style_frame, textvariable=self.config['style'], 
-                               values=["十字", "圆点", "混合", "圆圈", "自定义"], state="readonly")
+                               values=["十字", "圆点", "混合", "圆圈", "自定义图片"], state="readonly")
         type_cb.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         type_cb.bind("<<ComboboxSelected>>", self.on_style_change)
         
@@ -322,6 +413,12 @@ class ControlPanel:
         self.add_slider(size_frame, "大小", self.config['size'], 5, 100, 2)
         self.add_slider(size_frame, "粗细", self.config['thickness'], 1, 10, 3)
         self.add_slider(size_frame, "圆点大小", self.config['dot'], 1, 20, 4)
+        # Image scale with dynamic label: 图像(n%)
+        self.img_scale_label = tk.StringVar(value=f"图像({self.config['img_scale'].get()}%)")
+        ttk.Label(size_frame, textvariable=self.img_scale_label).grid(row=5, column=0, padx=5, pady=2)
+        img_scale_slider = ttk.Scale(size_frame, from_=5, to=200, variable=self.config['img_scale'],
+                                     orient="horizontal", command=self.on_img_scale_change)
+        img_scale_slider.grid(row=5, column=1, sticky="ew", padx=5, pady=2)
 
         # Position Controls
         pos_frame = ttk.LabelFrame(self.root, text="位置 (使用方向键微调)")
@@ -362,7 +459,7 @@ class ControlPanel:
         self.update_preset_list()
         
         # Set placeholder
-        self.preset_cb.set("<--下拉选择预设-->")
+        self.preset_cb.set(self.PRESET_PLACEHOLDER)
         
         btn_frame = ttk.Frame(preset_frame)
         btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=5)
@@ -373,8 +470,8 @@ class ControlPanel:
         
         ttk.Button(btn_frame, text="保存", command=self.save_preset).grid(row=0, column=0, sticky="ew", padx=2)
         ttk.Button(btn_frame, text="删除", command=self.delete_preset).grid(row=0, column=1, sticky="ew", padx=2)
-        ttk.Button(btn_frame, text="导入", command=self.import_preset).grid(row=0, column=2, sticky="ew", padx=2)
-        ttk.Button(btn_frame, text="分享", command=self.export_preset).grid(row=0, column=3, sticky="ew", padx=2)
+        ttk.Button(btn_frame, text="导入", command=self.import_preset_code).grid(row=0, column=2, sticky="ew", padx=2)
+        ttk.Button(btn_frame, text="分享", command=self.export_preset_code).grid(row=0, column=3, sticky="ew", padx=2)
 
         # System
         sys_frame = ttk.Frame(self.root)
@@ -401,6 +498,7 @@ class ControlPanel:
         hk_frame.pack(fill="x", padx=10, pady=5)
         hk_frame.columnconfigure(0, weight=1)
         hk_frame.columnconfigure(1, weight=1)
+        hk_frame.columnconfigure(2, weight=1)
         
         self.toggle_btn = ttk.Button(hk_frame, text="点击隐藏准星", command=self.toggle_crosshair_visible)
         self.toggle_btn.grid(row=0, column=0, sticky="ew", padx=2)
@@ -408,87 +506,287 @@ class ControlPanel:
         self.hotkey_btn = ttk.Button(hk_frame, text="绑定隐藏准星键", command=self.bind_hotkey)
         self.hotkey_btn.grid(row=0, column=1, sticky="ew", padx=2)
         
-        # Update button text if hotkey exists
+        self.mode_cb = ttk.Combobox(hk_frame, textvariable=self.config['trigger_mode'], 
+                                   values=["点击切换", "按住隐藏", "按住显示"], state="readonly", width=8)
+        self.mode_cb.grid(row=0, column=2, sticky="ew", padx=2)
+        self.mode_cb.bind("<<ComboboxSelected>>", self.apply_trigger)
+        
+        # Apply trigger if exists
         if self.config['hide_hotkey'].get():
             self.hotkey_btn.configure(text=f"快捷键: {self.config['hide_hotkey'].get()}")
-            try:
-                keyboard.add_hotkey(self.config['hide_hotkey'].get(), self.toggle_crosshair_visible)
-            except Exception as e:
-                print(f"Error registering hotkey: {e}")
+            self.apply_trigger()
 
         # Status
-        self.status_label = ttk.Label(self.root, text="作者moligod（B站抖音快手小红书同名）炸撤离点群727712220", foreground="green")
+        self.status_label = ttk.Label(self.root, text="作者moligod（B站抖音快手小红书同名）反馈群：856078436", foreground="green")
         self.status_label.pack(side="bottom", pady=(0, 5))
         ttk.Label(self.root, text="如若出现问题优先管理员启动，游戏内用快捷键必须管理员启动", foreground="red").pack(side="bottom", pady=(5, 0))
+        
+    def log(self, msg):
+        pass
 
     def toggle_crosshair_visible(self):
         if not self.overlay:
             return
-            
-        if self.crosshair_visible:
-            self.overlay.withdraw()
-            self.crosshair_visible = False
-            self.toggle_btn.configure(text="点击显示准星")
-        else:
-            self.overlay.deiconify()
-            self.overlay.keep_on_top()
-            self.crosshair_visible = True
-            self.toggle_btn.configure(text="点击隐藏准星")
+        self.set_visible(not self.crosshair_visible)
 
-    def bind_hotkey(self):
-        self.hotkey_btn.configure(text="按键 (ESC取消)...")
-        self.root.update()
+    # 增强的触发器应用逻辑
+    def apply_trigger(self, _=None):
+        with self.trigger_lock:  # 增加线程锁
+            # 彻底清理旧钩子
+            try:
+                # 尝试一次性清理所有热键，确保万无一失
+                try: keyboard.unhook_all_hotkeys()
+                except: pass
+                try: keyboard.unhook_all() # 补充清理全局 hook
+                except: pass
+                
+                for hook in self.keyboard_hooks:
+                    try: keyboard.remove_hotkey(hook)
+                    except: pass
+                    try: keyboard.unhook(hook)
+                    except: pass
+            except: pass
+            self.keyboard_hooks.clear()
+            
+            # 停止鼠标监听
+            if self.mouse_listener:
+                try: self.mouse_listener.stop()
+                except: pass
+                self.mouse_listener = None
+            
+            key = self.config['hide_hotkey'].get()
+            if not key:
+                self.hotkey_btn.configure(text="绑定隐藏准星键")
+                return
+                
+            t_type = self.config.get('trigger_type', tk.StringVar(value="keyboard")).get()
+            mode = self.config.get('trigger_mode', tk.StringVar(value="点击切换")).get()
+            
+            # Pre-convert key to string to avoid overhead in hook
+        target_key = str(key)
         
-        def on_key(event):
-            # Unhook first
-            keyboard.unhook(hook_id)
-            
-            key_name = event.name
-            
-            # Check for ESC to clear hotkey
-            if key_name.lower() == 'esc':
-                # Remove existing hotkey if any
-                old_hotkey = self.config['hide_hotkey'].get()
-                if old_hotkey:
+        # Initial visibility state based on mode
+        self.is_pressed = False
+        self.log(f"Applying trigger mode={mode}, type={t_type}, key={target_key}")
+        
+        # Debug: Log all inputs to verify if hooks are active
+        if t_type == "keyboard":
+            self.log("Keyboard hook active. Press any key to test...")
+        elif t_type == "mouse":
+            self.log("Mouse hook active. Click to test...")
+
+        if mode == "按住显示" or mode == "Hold_Show":
+            self.log(f"Initializing {mode} -> Hide")
+            # Force hide first
+            self.crosshair_visible = True # Trick to force update
+            self.set_visible(False, force=True)
+        else:
+            self.log(f"Initializing {mode} -> Show")
+            self.crosshair_visible = False # Trick to force update
+            self.set_visible(True, force=True)
+        
+        # Set new hooks
+        try:
+            if t_type == "keyboard":
+                    # 获取按键的 scan codes，用于更精确的匹配
+                    target_scan_codes = set()
                     try:
-                        keyboard.remove_hotkey(old_hotkey)
+                        # 尝试获取 scan codes，如果失败（如组合键），则降级到仅使用名称匹配
+                        codes = keyboard.key_to_scan_codes(target_key)
+                        if codes:
+                            target_scan_codes = set(codes)
+                        self.log(f"Target key: {target_key}, Scancodes: {target_scan_codes}")
                     except:
                         pass
+
+                    # 定义全局钩子函数
+                    def on_key_event(event):
+                        # Debug log for ALL key events
+                        # self.log(f"Debug: Key {event.name} ({event.scan_code}) {event.event_type}")
+
+                        # 检查是否匹配目标键
+                        is_match = False
+                        if target_scan_codes and event.scan_code in target_scan_codes:
+                            is_match = True
+                        elif event.name and event.name.lower() == target_key.lower():
+                            is_match = True
+                        
+                        if is_match:
+                            if mode in ["点击切换", "切换", "Toggle"]:
+                                if event.event_type == keyboard.KEY_DOWN:
+                                    self.log("Key Toggle")
+                                    self.root.after(0, self.toggle_crosshair_visible)
+                            elif mode in ["按住隐藏", "Hold_Hide"]:
+                                if event.event_type == keyboard.KEY_DOWN:
+                                    # Hide is cheap + repeat, use force=True (or force=False if too fast, but Hide is cheap)
+                                    # Actually for Hide, repeats are fine.
+                                    self.root.after(0, lambda: self.set_visible(False, force=True))
+                                elif event.event_type == keyboard.KEY_UP:
+                                    self.log("Key Hide UP")
+                                    self.root.after(0, lambda: self.set_visible(True, force=True))
+                            elif mode in ["按住显示", "Hold_Show"]:
+                                if event.event_type == keyboard.KEY_DOWN:
+                                    # Show is expensive + repeat, use force=False to rely on state check
+                                    self.root.after(0, lambda: self.set_visible(True, force=False))
+                                elif event.event_type == keyboard.KEY_UP:
+                                    # Hide is cheap + once, force it
+                                    self.log("Key Show UP")
+                                    self.root.after(0, lambda: self.set_visible(False, force=True))
+                    
+                    # 注册全局钩子
+                    hook = keyboard.hook(on_key_event)
+                    self.keyboard_hooks.append(hook)
+                        
+            elif t_type == "mouse":
+                    btn_map = {
+                        "Button.left": pynput_mouse.Button.left,
+                        "Button.right": pynput_mouse.Button.right,
+                        "Button.middle": pynput_mouse.Button.middle,
+                        "Button.x1": pynput_mouse.Button.x1,
+                        "Button.x2": pynput_mouse.Button.x2
+                    }
+                    
+                    target_btn = btn_map.get(target_key)
+                    if not target_btn:
+                        if "left" in target_key: target_btn = pynput_mouse.Button.left
+                        elif "right" in target_key: target_btn = pynput_mouse.Button.right
+                        elif "middle" in target_key: target_btn = pynput_mouse.Button.middle
+                    
+                    if not target_btn:
+                        print(f"Unknown mouse button: {target_key}")
+                        return
+
+                    if mode == "点击切换" or mode == "切换" or mode == "Toggle":
+                        def on_click(x, y, button, pressed):
+                            if button == target_btn and pressed:
+                                self.log("Mouse Toggle")
+                                self.root.after(0, self.toggle_crosshair_visible)
+                        
+                        self.mouse_listener = pynput_mouse.Listener(on_click=on_click)
+                        self.mouse_listener.start()
+                        
+                    elif mode == "按住隐藏" or mode == "Hold_Hide":
+                        def on_click(x, y, button, pressed):
+                            if button == target_btn:
+                                if pressed:
+                                    if not self.is_pressed:
+                                        self.is_pressed = True
+                                        self.log("Mouse Hide DOWN")
+                                        self.root.after(0, lambda: self.set_visible(False, force=True))
+                                else:
+                                    self.is_pressed = False
+                                    self.log("Mouse Hide UP")
+                                    self.root.after(0, lambda: self.set_visible(True, force=True))
+                        self.mouse_listener = pynput_mouse.Listener(on_click=on_click)
+                        self.mouse_listener.start()
+                        
+                    elif mode == "按住显示" or mode == "Hold_Show":
+                        def on_click(x, y, button, pressed):
+                            # Debug log for ALL clicks
+                            # self.log(f"Debug: Mouse {button} {'Pressed' if pressed else 'Released'}")
+                            
+                            if button == target_btn:
+                                if pressed:
+                                    # self.log("Mouse Show DOWN")
+                                    self.root.after(0, lambda: self.set_visible(True, force=False))
+                                else:
+                                    self.log("Mouse Show UP")
+                                    self.root.after(0, lambda: self.set_visible(False, force=True))
+                        self.mouse_listener = pynput_mouse.Listener(on_click=on_click)
+                        self.mouse_listener.start()
+                        
+        except Exception as e:
+            print(f"Error applying trigger: {e}")
+            messagebox.showerror("错误", f"快捷键绑定失败: {e}")
+
+    def set_visible(self, visible, force=False):
+        if not self.overlay: return
+        
+        # Optimization: Don't do anything if state hasn't changed
+        if not force and visible == self.crosshair_visible:
+            print(f"DEBUG: Skipping set_visible {visible} (current={self.crosshair_visible}, force={force})")
+            return
+            
+        # Strategy: Use Canvas item state instead of window visibility
+        # This is the fastest method and avoids window manager issues
+        try:
+            state = 'normal' if visible else 'hidden'
+            self.overlay.canvas.itemconfigure("crosshair", state=state)
+            
+            if visible:
+                self.overlay.deiconify()
+                # Ensure topmost just in case, but don't force it every time to avoid overhead
+                self.overlay.lift()
+                self.overlay.attributes('-topmost', True)
                 
-                # Clear config and UI
-                self.config['hide_hotkey'].set("")
-                self.hotkey_btn.configure(text="绑定隐藏准星键")
-                self.save_config()
-                return
-            
-            # Remove old hotkey if exists
-            old_hotkey = self.config['hide_hotkey'].get()
-            if old_hotkey:
+                self.crosshair_visible = True
+                self.toggle_btn.configure(text="点击隐藏准星")
+            else:
+                self.crosshair_visible = False
+                self.toggle_btn.configure(text="点击显示准星")
+        except Exception as e:
+            print(f"Error setting visibility: {e}")
+
+    def bind_hotkey(self):
+        self.hotkey_btn.configure(text="按键/鼠标 (ESC取消)...")
+        self.root.update()
+        
+        # Temp storage for hooks to remove them later
+        temp_hooks = []
+        
+        def finish_bind():
+            for h in temp_hooks:
                 try:
-                    keyboard.remove_hotkey(old_hotkey)
-                except:
-                    pass
+                    keyboard.unhook(h)
+                except: pass
+                try:
+                    # mouse.unhook(h)
+                    if hasattr(h, 'stop'): h.stop()
+                except: pass
             
-            # Set new hotkey
-            self.config['hide_hotkey'].set(key_name)
-            self.hotkey_btn.configure(text=f"快捷键: {key_name}")
-            
-            # Register new hotkey
-            try:
-                keyboard.add_hotkey(key_name, self.toggle_crosshair_visible)
-            except Exception as e:
-                messagebox.showerror("错误", f"无法绑定快捷键: {e}")
-                self.hotkey_btn.configure(text="绑定隐藏准星键")
-                self.config['hide_hotkey'].set("")
-            
-            # Save config immediately
+            # Re-apply with new config
+            self.apply_trigger()
             self.save_config()
+            
+            # Feedback
+            key_name = self.config['hide_hotkey'].get()
+            if key_name:
+                self.root.after(100, lambda: messagebox.showinfo("绑定成功", f"快捷键已设置为: {key_name}\n模式: {self.config['trigger_mode'].get()}"))
 
-        # Hook a single key press
-        def safe_on_key(event):
-             self.root.after(0, lambda: on_key(event))
+        def on_key(event):
+            if event.event_type == 'down':
+                key_name = event.name
+                
+                if key_name.lower() == 'esc':
+                    # Cancel/Clear
+                    self.config['hide_hotkey'].set("")
+                    self.hotkey_btn.configure(text="绑定隐藏准星键")
+                    finish_bind()
+                    return True
+                
+                self.config['hide_hotkey'].set(key_name)
+                self.config['trigger_type'].set("keyboard")
+                self.hotkey_btn.configure(text=f"快捷键: {key_name}")
+                finish_bind()
+                return True
 
-        hook_id = keyboard.on_press(safe_on_key)
+        def on_click(x, y, button, pressed):
+            if pressed:
+                btn_name = str(button) # e.g. Button.left
+                self.config['hide_hotkey'].set(btn_name)
+                self.config['trigger_type'].set("mouse")
+                self.hotkey_btn.configure(text=f"快捷键: {btn_name}")
+                finish_bind()
+                # Stop listener
+                return False 
+
+        # Hook both
+        h_k = keyboard.hook(on_key)
+        # h_m = mouse.hook(on_mouse)
+        h_m = pynput_mouse.Listener(on_click=on_click)
+        h_m.start()
+        
+        temp_hooks.extend([h_k, h_m])
 
     def add_slider(self, parent, label, var, min_val, max_val, row):
         ttk.Label(parent, text=label).grid(row=row, column=0, padx=5, pady=2)
@@ -506,7 +804,7 @@ class ControlPanel:
         # Always enable image button so user can click it directly to switch mode
         # If user switches dropdown manually, we check if image path is needed
         # Only prompt for image if it's a user interaction (event is not None) or if path is truly empty during init
-        if (style == "Custom" or style == "自定义"):
+        if (style == "Custom" or style in ["自定义图片", "自定义"]):
             if not self.config['image_path'].get():
                 # If switched to Custom but no image, prompt to choose
                 # Use 'after' to avoid blocking the event loop immediately
@@ -521,12 +819,12 @@ class ControlPanel:
     def choose_image(self):
         file_path = filedialog.askopenfilename(
             title="选择图片",
-            filetypes=[("Image Files", "*.png;*.gif;*.ppm;*.pnm")]
+            filetypes=[("Image Files", "*.png;*.gif;*.jpg;*.jpeg;*.bmp;*.ppm;*.pnm")]
         )
         if file_path:
             self.config['image_path'].set(file_path)
             # Auto switch to Custom style
-            self.config['style'].set("自定义")
+            self.config['style'].set("自定义图片")
             self.update_overlay()
 
     def drag_start(self, event):
@@ -554,7 +852,12 @@ class ControlPanel:
 
     def update_overlay(self, _=None):
         if self.overlay:
-            self.overlay.redraw()
+            try:
+                self.overlay.redraw()
+            finally:
+                # Ensure the newly drawn items align with current visibility state
+                # so that switching样式或启动后的首次绘制不会出现状态不同步导致的“看不见”
+                self.set_visible(self.crosshair_visible, force=True)
 
     def update_pos(self, *args):
         if self.overlay:
@@ -592,12 +895,17 @@ class ControlPanel:
         self.update_pos()
 
     def update_preset_list(self):
-        preset_names = list(self.presets.keys())
-        self.preset_cb['values'] = preset_names
+        # Clean any accidental placeholder saved as a preset
+        if self.PRESET_PLACEHOLDER in self.presets:
+            try: del self.presets[self.PRESET_PLACEHOLDER]
+            except: pass
+        names = [n for n in self.presets.keys() if n != self.PRESET_PLACEHOLDER]
+        self.preset_cb['values'] = names
 
     def save_preset(self):
         name = self.current_preset_name.get().strip()
-        if not name:
+        if not name or name == self.PRESET_PLACEHOLDER:
+            messagebox.showerror("无效名称", "请先在上方输入或选择一个有效的预设名称。")
             return
             
         # Capture current settings
@@ -606,6 +914,7 @@ class ControlPanel:
             "thickness": self.config['thickness'].get(),
             "color": self.config['color'].get(),
             "dot": self.config['dot'].get(),
+            "img_scale": self.config['img_scale'].get(),
             "style": self.config['style'].get(),
             "image_path": self.config['image_path'].get()
         }
@@ -615,7 +924,7 @@ class ControlPanel:
         
     def load_preset(self, event=None):
         name = self.current_preset_name.get()
-        if name == "<--下拉选择预设-->":
+        if name == self.PRESET_PLACEHOLDER:
             return
             
         if name in self.presets:
@@ -624,6 +933,7 @@ class ControlPanel:
             self.config['thickness'].set(data.get("thickness", 2))
             self.config['color'].set(data.get("color", "#00FF00"))
             self.config['dot'].set(data.get("dot", 4))
+            self.config['img_scale'].set(data.get("img_scale", 100))
             self.config['style'].set(data.get("style", "十字"))
             self.config['image_path'].set(data.get("image_path", ""))
             
@@ -637,70 +947,96 @@ class ControlPanel:
             self.current_preset_name.set("")
             self.update_preset_list()
 
-    def export_preset(self):
+    def export_preset_code(self):
         name = self.current_preset_name.get()
-        if not name or name not in self.presets:
-            return
+        if not name:
+            # If no preset selected, maybe export current settings?
+            # Let's ask for a name first
+            name = simpledialog.askstring("分享配置", "请为当前配置命名：", initialvalue="我的配置")
+            if not name: return
             
-        data = self.presets[name]
-        
-        # Check if custom image
-        if data.get('style') in ["Custom", "自定义"]:
-            proceed = messagebox.askokcancel(
-                "分享警告", 
-                "该方案使用了自定义图片。\n\n分享方案仅包含配置信息，不包含图片文件。\n接收方需要手动设置同名图片才能正常显示。\n\n是否继续？"
-            )
-            if not proceed:
-                return
+            # Create temp data from current settings
+            data = {
+                "size": self.config['size'].get(),
+                "thickness": self.config['thickness'].get(),
+                "color": self.config['color'].get(),
+                "dot": self.config['dot'].get(),
+                "img_scale": self.config['img_scale'].get(),
+                "style": self.config['style'].get(),
+                "image_path": "" # Don't export local path
+            }
+        elif name in self.presets:
+            data = self.presets[name].copy()
+            data['image_path'] = "" # Clear image path for sharing
+        else:
+            return
 
-        # Add name to exported data for convenience
+        # Check if custom image (warn user)
+        if self.config['style'].get() in ["Custom", "自定义图片", "自定义"]:
+            messagebox.showwarning("提示", "自定义图片无法通过口令分享。\n对方只能看到配置参数，图片需要手动设置。")
+
         data['name'] = name
         
-        file_path = filedialog.asksaveasfilename(
-            title="分享方案",
-            defaultextension=".json",
-            initialfile=f"{name}.json",
-            filetypes=[("JSON Files", "*.json")]
-        )
-        
-        if file_path:
-            try:
-                with open(file_path, "w", encoding='utf-8') as f:
-                    json.dump(data, f, indent=4, ensure_ascii=False)
-            except Exception as e:
-                print(f"Error exporting preset: {e}")
+        try:
+            # JSON -> String -> Bytes -> Compress -> Base64
+            json_str = json.dumps(data, ensure_ascii=False)
+            compressed = zlib.compress(json_str.encode('utf-8'))
+            b64_str = base64.b64encode(compressed).decode('utf-8')
+            
+            code = f"MOLI#{b64_str}"
+            
+            # Copy to clipboard
+            self.root.clipboard_clear()
+            self.root.clipboard_append(code)
+            self.root.update()
+            
+            messagebox.showinfo("分享成功", f"分享口令已复制到剪贴板！\n\n发送给好友，点击“导入”即可使用。")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"生成口令失败: {e}")
 
-    def import_preset(self):
-        file_path = filedialog.askopenfilename(
-            title="导入方案",
-            filetypes=[("JSON Files", "*.json")]
-        )
+    def import_preset_code(self):
+        code = simpledialog.askstring("导入口令", "请粘贴 MOLI# 开头的分享口令：")
+        if not code: return
         
-        if file_path:
-            try:
-                with open(file_path, "r", encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                # Use name from file or filename
-                name = data.get('name', os.path.splitext(os.path.basename(file_path))[0])
-                
-                # Sanitize data to ensure it has required fields
-                clean_data = {
-                    "size": data.get("size", 20),
-                    "thickness": data.get("thickness", 2),
-                    "color": data.get("color", "#00FF00"),
-                    "dot": data.get("dot", 4),
-                    "style": data.get("style", "十字"),
-                    "image_path": data.get("image_path", "")
-                }
-                
-                self.presets[name] = clean_data
-                self.current_preset_name.set(name)
-                self.update_preset_list()
-                self.load_preset() # Auto apply imported preset
-                
-            except Exception as e:
-                print(f"Error importing preset: {e}")
+        code = code.strip()
+        if not code.startswith("MOLI#"):
+            messagebox.showerror("错误", "无效的口令格式 (必须以 MOLI# 开头)")
+            return
+            
+        try:
+            b64_str = code[5:]
+            compressed = base64.b64decode(b64_str)
+            json_str = zlib.decompress(compressed).decode('utf-8')
+            data = json.loads(json_str)
+            
+            name = data.get('name', '导入配置')
+            
+            # Check for conflict
+            if name in self.presets:
+                if not messagebox.askyesno("覆盖确认", f"方案 [{name}] 已存在，是否覆盖？"):
+                    return
+
+            # Sanitize data
+            clean_data = {
+                "size": data.get("size", 20),
+                "thickness": data.get("thickness", 2),
+                "color": data.get("color", "#00FF00"),
+                "dot": data.get("dot", 4),
+                "img_scale": data.get("img_scale", 100),
+                "style": data.get("style", "十字"),
+                "image_path": ""
+            }
+            
+            self.presets[name] = clean_data
+            self.current_preset_name.set(name)
+            self.update_preset_list()
+            self.load_preset()
+            
+            messagebox.showinfo("成功", f"方案 [{name}] 导入成功！")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"解析口令失败: {e}")
 
     def resource_path(self, relative_path):
         """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -712,38 +1048,41 @@ class ControlPanel:
 
         return os.path.join(base_path, relative_path)
 
-    def get_config_path(self):
-        app_data = os.getenv('LOCALAPPDATA')
-        if not app_data:
-            app_data = os.path.expanduser('~')
-        
-        app_dir = os.path.join(app_data, 'MoligodCrosshair')
-        if not os.path.exists(app_dir):
-            os.makedirs(app_dir)
-            
-        return os.path.join(app_dir, 'config.json')
-
     def load_config(self):
-        config_path = self.get_config_path()
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, "r", encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.pos_x.set(str(data.get("pos_x", self.screen_w // 2)))
-                    self.pos_y.set(str(data.get("pos_y", self.screen_h // 2)))
-                    
-                    self.config['size'].set(data.get("size", 20))
-                    self.config['thickness'].set(data.get("thickness", 2))
-                    self.config['color'].set(data.get("color", "#00FF00"))
-                    self.config['dot'].set(data.get("dot", 4))
-                    self.config['style'].set(data.get("style", "十字"))
-                    self.config['image_path'].set(data.get("image_path", ""))
-                    self.config['force_admin'].set(data.get("force_admin", False))
-                    self.config['hide_hotkey'].set(data.get("hide_hotkey", ""))
-                    
-                    self.presets = data.get("presets", {})
-            except Exception as e:
-                print(f"Error loading config: {e}")
+        data = {}
+        # Try loading from Registry first
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\MoligodCrosshair", 0, winreg.KEY_READ)
+            json_str, _ = winreg.QueryValueEx(key, "Config")
+            data = json.loads(json_str)
+            winreg.CloseKey(key)
+        except FileNotFoundError:
+            pass # No config found, use defaults
+        except Exception as e:
+            print(f"Error loading registry config: {e}")
+
+        # Apply config
+        self.pos_x.set(str(data.get("pos_x", self.screen_w // 2)))
+        self.pos_y.set(str(data.get("pos_y", self.screen_h // 2)))
+        
+        self.config['size'].set(data.get("size", 20))
+        self.config['thickness'].set(data.get("thickness", 2))
+        self.config['color'].set(data.get("color", "#00FF00"))
+        self.config['dot'].set(data.get("dot", 4))
+        _style_val = data.get("style", "十字")
+        if _style_val == "自定义":
+            _style_val = "自定义图片"
+        self.config['style'].set(_style_val)
+        self.config['img_scale'].set(data.get("img_scale", 100))
+        self.config['image_path'].set(data.get("image_path", ""))
+        self.config['force_admin'].set(data.get("force_admin", False))
+        self.config['hide_hotkey'].set(data.get("hide_hotkey", ""))
+        self.config['trigger_type'].set(data.get("trigger_type", "keyboard"))
+        val = data.get("trigger_mode", "点击切换")
+        if val == "切换": val = "点击切换"
+        self.config['trigger_mode'].set(val)
+        
+        self.presets = data.get("presets", {})
 
     def save_config(self):
         try:
@@ -760,30 +1099,33 @@ class ControlPanel:
             "thickness": self.config['thickness'].get(),
             "color": self.config['color'].get(),
             "dot": self.config['dot'].get(),
+            "img_scale": self.config['img_scale'].get(),
             "style": self.config['style'].get(),
             "image_path": self.config['image_path'].get(),
             "force_admin": self.config['force_admin'].get(),
             "hide_hotkey": self.config['hide_hotkey'].get(),
+            "trigger_type": self.config['trigger_type'].get(),
+            "trigger_mode": self.config['trigger_mode'].get(),
             "presets": self.presets
         }
+        
+        # Save to Registry
         try:
-            with open(self.get_config_path(), "w", encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\MoligodCrosshair")
+            json_str = json.dumps(data, ensure_ascii=False)
+            winreg.SetValueEx(key, "Config", 0, winreg.REG_SZ, json_str)
+            winreg.CloseKey(key)
         except Exception as e:
-            print(f"Error saving config: {e}")
+            print(f"Error saving config to registry: {e}")
 
 def check_force_admin():
-    # Helper to check config file before initializing UI
+    # Helper to check config before initializing UI
     try:
-        # Re-use logic to get config path (duplicated briefly for standalone function)
-        app_data = os.getenv('LOCALAPPDATA')
-        if not app_data: app_data = os.path.expanduser('~')
-        config_path = os.path.join(app_data, 'MoligodCrosshair', 'config.json')
-        
-        if os.path.exists(config_path):
-            with open(config_path, "r", encoding='utf-8') as f:
-                data = json.load(f)
-                return data.get("force_admin", False)
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\MoligodCrosshair", 0, winreg.KEY_READ)
+        json_str, _ = winreg.QueryValueEx(key, "Config")
+        data = json.loads(json_str)
+        winreg.CloseKey(key)
+        return data.get("force_admin", False)
     except:
         pass
     return False
