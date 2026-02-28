@@ -24,10 +24,21 @@ import tkinter.simpledialog as simpledialog
 import tkinter.scrolledtext as scrolledtext
 import datetime
 
+# 解决高DPI下的缩放问题，防止DWM合成时的帧率不匹配
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 # Windows API constants for click-through
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080 # 不在Alt-Tab和任务栏显示
+WS_EX_NOACTIVATE = 0x08000000 # 不激活窗口
 
 class CrosshairOverlay(tk.Toplevel):
     def __init__(self, master, config):
@@ -81,27 +92,58 @@ class CrosshairOverlay(tk.Toplevel):
         self.configure(bg=color)
 
     def keep_on_top(self):
-        """Periodically enforce topmost status to fight against some window managers"""
+        """Periodically enforce topmost status and styles"""
         try:
-            self.wm_attributes("-topmost", True)
-            # Optional: Use Windows API to force topmost without activating
-            hwnd = self.winfo_id()
+            if not self.winfo_viewable():
+                self.after(5000, self.keep_on_top)
+                return
+
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if hwnd == 0:
+                hwnd = self.winfo_id()
+            
             if hwnd:
-                # HWND_TOPMOST = -1
-                # SWP_NOMOVE(2) | SWP_NOSIZE(1) | SWP_NOACTIVATE(10) = 0x13
-                ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)
+                # 1. Check TopMost
+                # GetWindowLong only returns styles, check extended style for WS_EX_TOPMOST (0x8)
+                current_ex_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                is_topmost = (current_ex_style & 0x8) != 0
+                
+                if not is_topmost:
+                    # HWND_TOPMOST = -1, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE
+                    ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0013)
+                
+                # 2. Enforce Styles (Transparent, Layered, ToolWindow, NoActivate)
+                required = WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+                
+                if (current_ex_style & required) != required:
+                    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, current_ex_style | required)
+                    
         except Exception:
             pass
-        self.after(2000, self.keep_on_top)
+        
+        # Check every 5 seconds to minimize overhead
+        self.after(5000, self.keep_on_top)
 
     def apply_click_through(self):
         try:
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
             if hwnd == 0:
                 hwnd = self.winfo_id()
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            style = style | WS_EX_TRANSPARENT | WS_EX_LAYERED
-            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            
+            # Get current style
+            current_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            
+            # Add styles:
+            # WS_EX_TRANSPARENT: Click-through
+            # WS_EX_LAYERED: Alpha blending
+            # WS_EX_TOOLWINDOW: Hide from Alt-Tab/Taskbar (helps with overlay behavior)
+            # WS_EX_NOACTIVATE: Prevent window activation (helps with focus stealing)
+            new_style = current_style | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            
+            if new_style != current_style:
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+                # Force a redraw to apply style changes correctly if needed
+                # ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027) 
         except Exception as e:
             print(f"Error setting click-through: {e}")
 
@@ -162,11 +204,17 @@ class CrosshairOverlay(tk.Toplevel):
                     scale = int(self.config.get('img_scale', {}).get())
                 except Exception:
                     scale = 100
+                # Crop transparent areas to reduce window size and DWM load
+                bbox = im.getbbox()
+                if bbox:
+                    im = im.crop(bbox)
+
                 scale = max(5, min(200, scale))
                 if scale != 100:
                     new_w = max(1, int(im.width * scale / 100))
                     new_h = max(1, int(im.height * scale / 100))
                     im = im.resize((new_w, new_h), Image.LANCZOS)
+                
                 self.image_ref = ImageTk.PhotoImage(im)
                 req_w, req_h = self.image_ref.width(), self.image_ref.height()
                 max_w = max(1, self.winfo_screenwidth() * 2)
