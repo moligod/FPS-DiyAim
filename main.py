@@ -23,6 +23,8 @@ import tkinter.simpledialog as simpledialog
 
 import tkinter.scrolledtext as scrolledtext
 import datetime
+import urllib.request
+import urllib.error
 
 # 解决高DPI下的缩放问题，防止DWM合成时的帧率不匹配
 try:
@@ -264,7 +266,7 @@ import webbrowser
 class ControlPanel:
     def __init__(self):
         self.root = tk.Tk()
-        self.version = "v1.0"
+        self.version = "v4.0"
 
         
         # 针对高DPI的字体缩放补偿
@@ -293,7 +295,6 @@ class ControlPanel:
         except:
             pass
             
-        # 根据DPI动态调整窗口大小
         base_w, base_h = 360, 560
         try:
              dpi = ctypes.windll.user32.GetDpiForSystem()
@@ -303,10 +304,10 @@ class ControlPanel:
                  base_h = int(base_h * scale)
         except:
              pass
-             
-        self.root.geometry(f"{base_w}x{base_h}")
-        self.root.resizable(False, False)
-        
+
+        self.base_width = base_w
+        self.base_height = base_h
+
         self.overlay = None
         
         # Configuration Variables
@@ -351,6 +352,12 @@ class ControlPanel:
         self.load_config()
         
         self.create_widgets()
+
+        self.root.update_idletasks()
+        req_w = max(self.base_width, self.root.winfo_reqwidth())
+        req_h = self.root.winfo_reqheight()
+        self.root.geometry(f"{req_w}x{req_h}")
+        self.root.resizable(False, False)
         
         self.start_overlay()
         
@@ -372,6 +379,7 @@ class ControlPanel:
         # Start tray icon in separate thread
         self.tray_icon = None
         
+        self.root.after(1000, self.check_update_silent)
         self.root.mainloop()
 
     def on_img_scale_change(self, val):
@@ -609,7 +617,6 @@ class ControlPanel:
             self.hotkey_btn.configure(text=f"快捷键: {self.config['hide_hotkey'].get()}")
             self.apply_trigger()
 
-        # Status
         status_frame = ttk.Frame(self.root)
         status_frame.pack(side="bottom", fill="x", pady=(0, 5))
 
@@ -618,17 +625,48 @@ class ControlPanel:
         
         ttk.Label(self.root, text="如若出现问题优先管理员启动，游戏内用快捷键必须管理员启动", foreground="red").pack(side="bottom", pady=(5, 0))
 
-        # Version & Update
         ver_frame = ttk.Frame(status_frame)
         ver_frame.pack(side="top", pady=2)
         
-        ttk.Label(ver_frame, text=f"当前版本: {self.version}", foreground="gray").pack(side="left", padx=5)
-        update_link = ttk.Label(ver_frame, text="[检查更新]", foreground="blue", cursor="hand2")
-        update_link.pack(side="left", padx=5)
-        update_link.bind("<Button-1>", lambda e: self.open_update_url())
+        self.version_label = ttk.Label(ver_frame, text=f"当前版本: {self.version}", foreground="gray")
+        self.version_label.pack(side="left", padx=5)
+        self.update_link = ttk.Label(ver_frame, text="[检查更新]", foreground="blue", cursor="hand2")
+        self.update_link.pack(side="left", padx=5)
+        self.update_link.bind("<Button-1>", lambda e: self.check_update_manual())
 
     def open_update_url(self):
         webbrowser.open("https://github.com/moligod/FPSDiyAim/releases")
+
+    def check_update_silent(self):
+        threading.Thread(target=self._check_update_worker, args=(False,), daemon=True).start()
+
+    def check_update_manual(self):
+        threading.Thread(target=self._check_update_worker, args=(True,), daemon=True).start()
+
+    def _check_update_worker(self, show_message):
+        url = "https://api.github.com/repos/moligod/FPSDiyAim/releases/latest"
+        latest = None
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "FPSDiyAim"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8", "ignore"))
+            tag = data.get("tag_name") or data.get("name")
+            if isinstance(tag, str):
+                latest = tag.strip()
+        except Exception:
+            latest = None
+
+        if latest:
+            def update_ui():
+                text = f"当前版本: {self.version}，最新: {latest}"
+                if hasattr(self, "version_label"):
+                    self.version_label.config(text=text)
+                if show_message and latest != self.version:
+                    messagebox.showinfo("发现新版本", f"当前版本: {self.version}\n最新版本: {latest}\n\n即将打开 GitHub Releases 页面。")
+                    self.open_update_url()
+            self.root.after(0, update_ui)
+        elif show_message:
+            self.root.after(0, lambda: messagebox.showinfo("检查更新", "暂时无法获取版本信息。"))
 
     def log(self, msg):
         pass
