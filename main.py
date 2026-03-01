@@ -26,12 +26,30 @@ import datetime
 
 # 解决高DPI下的缩放问题，防止DWM合成时的帧率不匹配
 try:
+    # 0: DPI_AWARENESS_INVALID
+    # 1: DPI_AWARENESS_SYSTEM_AWARE (整个系统统一缩放)
+    # 2: DPI_AWARENESS_PER_MONITOR_AWARE (每个显示器独立缩放)
+    # 使用 1 可能会导致界面在高 DPI 屏幕上看起来较小，但兼容性最好，能解决 DWM 合成问题
+    # 使用 0 则是由系统接管缩放，界面会模糊但大小正常
+    # 为了解决锁帧问题我们启用了 DPI Awareness，但这会导致界面不再被系统自动放大
+    
+    # 尝试使用 ctypes.windll.shcore.SetProcessDpiAwareness(1)
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except Exception:
     try:
         ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
+
+# 自动适配屏幕缩放比例
+def get_dpi_scaling():
+    try:
+        root = tk.Tk()
+        scaling = root.tk.call('tk', 'scaling')
+        root.destroy()
+        return scaling
+    except:
+        return 1.33 # Default fallback
 
 # Windows API constants for click-through
 GWL_EXSTYLE = -20
@@ -241,10 +259,25 @@ class CrosshairOverlay(tk.Toplevel):
         tl_y = y - self.height // 2
         self.geometry(f"{self.width}x{self.height}+{tl_x}+{tl_y}")
 
+import webbrowser
+
 class ControlPanel:
     def __init__(self):
         self.root = tk.Tk()
+        self.version = "v1.0"
+
         
+        # 针对高DPI的字体缩放补偿
+        # Tkinter 默认在 DPI Aware 模式下不会自动放大字体，导致界面很小
+        # 需要手动根据 DPI 设置 scaling
+        try:
+            # 获取系统 DPI (96 is default)
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+            scale_factor = dpi / 96.0
+            self.root.tk.call('tk', 'scaling', scale_factor * 1.33) 
+        except:
+            pass
+
         # Check Admin Status
         self.is_admin = ctypes.windll.shell32.IsUserAnAdmin()
         title = "自定义准星"
@@ -259,7 +292,19 @@ class ControlPanel:
             self.root.iconbitmap(self.resource_path("tx.ico"))
         except:
             pass
-        self.root.geometry("360x560")
+            
+        # 根据DPI动态调整窗口大小
+        base_w, base_h = 360, 560
+        try:
+             dpi = ctypes.windll.user32.GetDpiForSystem()
+             scale = dpi / 96.0
+             if scale > 1.0:
+                 base_w = int(base_w * scale)
+                 base_h = int(base_h * scale)
+        except:
+             pass
+             
+        self.root.geometry(f"{base_w}x{base_h}")
         self.root.resizable(False, False)
         
         self.overlay = None
@@ -565,10 +610,26 @@ class ControlPanel:
             self.apply_trigger()
 
         # Status
-        self.status_label = ttk.Label(self.root, text="作者moligod（B站抖音快手小红书同名）反馈群：856078436", foreground="green")
-        self.status_label.pack(side="bottom", pady=(0, 5))
-        ttk.Label(self.root, text="如若出现问题优先管理员启动，游戏内用快捷键必须管理员启动", foreground="red").pack(side="bottom", pady=(5, 0))
+        status_frame = ttk.Frame(self.root)
+        status_frame.pack(side="bottom", fill="x", pady=(0, 5))
+
+        self.status_label = ttk.Label(status_frame, text="作者moligod（B站抖音快手小红书同名）反馈群：856078436", foreground="green", anchor="center")
+        self.status_label.pack(side="top", pady=2)
         
+        ttk.Label(self.root, text="如若出现问题优先管理员启动，游戏内用快捷键必须管理员启动", foreground="red").pack(side="bottom", pady=(5, 0))
+
+        # Version & Update
+        ver_frame = ttk.Frame(status_frame)
+        ver_frame.pack(side="top", pady=2)
+        
+        ttk.Label(ver_frame, text=f"当前版本: {self.version}", foreground="gray").pack(side="left", padx=5)
+        update_link = ttk.Label(ver_frame, text="[检查更新]", foreground="blue", cursor="hand2")
+        update_link.pack(side="left", padx=5)
+        update_link.bind("<Button-1>", lambda e: self.open_update_url())
+
+    def open_update_url(self):
+        webbrowser.open("https://github.com/moligod/FPSDiyAim/releases")
+
     def log(self, msg):
         pass
 

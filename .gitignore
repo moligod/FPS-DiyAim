@@ -1,5 +1,6 @@
 build/
 dist/
+dist_releas/
 __pycache__/
 *.spec
 build_venv/
